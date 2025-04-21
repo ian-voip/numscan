@@ -167,7 +167,6 @@ var scanCmd = &cobra.Command{
 					"origination_caller_id_name":   "CLI",
 					"origination_caller_id_number": "1000",
 					"call_timeout":                 fmt.Sprintf("%d", ringTime),
-					"execute_on_answer":            "uuid_kill ${uuid}",
 				}
 
 				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(ringTime+5)*time.Second)
