@@ -17,12 +17,14 @@ var (
 	csvPath     string
 	ringTime    int
 	concurrency int
+	dialDelay   int // 新增撥號延遲變數 (毫秒)
 )
 
 func init() {
 	scanCmd.Flags().StringVarP(&csvPath, "csv", "c", "", "CSV 檔案路徑 (必填)")
 	scanCmd.Flags().IntVarP(&ringTime, "ring", "r", 30, "響鈴時間（秒）")
 	scanCmd.Flags().IntVarP(&concurrency, "concurrency", "n", 1, "並發撥號數量")
+	scanCmd.Flags().IntVarP(&dialDelay, "delay", "d", 100, "撥號間隔延遲（毫秒）") // 新增延遲參數
 	scanCmd.MarkFlagRequired("csv")
 	rootCmd.AddCommand(scanCmd)
 }
@@ -34,6 +36,7 @@ var scanCmd = &cobra.Command{
 		fmt.Printf("準備執行 CSV 批次：%s\n", csvPath)
 		fmt.Printf("設置響鈴時間：%d 秒\n", ringTime)
 		fmt.Printf("設置並發數量：%d\n", concurrency)
+		fmt.Printf("設置撥號延遲：%d 毫秒\n", dialDelay) // 新增延遲輸出
 
 		file, err := os.Open(csvPath)
 		if err != nil {
@@ -48,6 +51,19 @@ var scanCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "讀取 CSV 失敗: %v\n", err)
 			os.Exit(1)
 		}
+
+		// 創建或開啟輸出檔案
+		outFile, err := os.OpenFile("output.csv", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "無法開啟輸出檔案: %v\n", err)
+			os.Exit(1)
+		}
+		defer outFile.Close()
+		writer := csv.NewWriter(outFile)
+		defer writer.Flush()
+
+		// 建立寫入用的互斥鎖
+		var writerMutex sync.Mutex
 
 		// 讀取已有的結果
 		existingResults := make(map[string]string)
@@ -86,6 +102,65 @@ var scanCmd = &cobra.Command{
 		// 用於追蹤已處理的撥號任務
 		processedNumbers := make(map[string]bool)
 
+		// 修改 processAnswer 和 processHangup 函數，實現即時寫入
+		processAnswerFunc := func(number string, results [][]string, records [][]string, processedNumbers map[string]bool, mu *sync.Mutex, done chan struct{}) {
+			for i, record := range records {
+				if len(record) > 0 && record[0] == number {
+					mu.Lock()
+					isProcessed := processedNumbers[number]
+					if !isProcessed {
+						results[i] = []string{number, "ANSWERED"}
+						processedNumbers[number] = true
+						log.Printf("結果已更新: 索引=%d, 號碼=%s, 結果=ANSWERED", i, number)
+
+						// 即時寫入 CSV
+						writerMutex.Lock()
+						writer.Write([]string{number, "ANSWERED"})
+						writer.Flush()
+						writerMutex.Unlock()
+						log.Printf("已即時寫入 CSV: %s -> ANSWERED", number)
+					}
+					mu.Unlock()
+					break
+				}
+			}
+			checkCompletion(processedNumbers, records, mu, done)
+		}
+
+		processHangupFunc := func(number, cause string, results [][]string, records [][]string, processedNumbers map[string]bool, mu *sync.Mutex, done chan struct{}, event *eslgo.Event) {
+			for i, record := range records {
+				if len(record) > 0 && record[0] == number {
+					mu.Lock()
+					isProcessed := processedNumbers[number]
+					if !isProcessed {
+						// 根據掛斷原因設置不同的結果
+						var result string
+						switch cause {
+
+						case "NORMAL_CLEARING":
+							result = "ANSWERED" // 正常通話結束
+						default:
+							result = cause // 其他原因直接使用原始原因
+						}
+
+						results[i] = []string{number, result}
+						processedNumbers[number] = true
+						log.Printf("結果已更新: 索引=%d, 號碼=%s, 結果=%s (原始原因: %s)", i, number, result, cause)
+
+						// 即時寫入 CSV
+						writerMutex.Lock()
+						writer.Write([]string{number, result})
+						writer.Flush()
+						writerMutex.Unlock()
+						log.Printf("已即時寫入 CSV: %s -> %s", number, result)
+					}
+					mu.Unlock()
+					break
+				}
+			}
+			checkCompletion(processedNumbers, records, mu, done)
+		}
+
 		listenerID := conn.RegisterEventListener(eslgo.EventListenAll, func(event *eslgo.Event) {
 			eventName := event.GetName()
 			uuid := event.GetHeader("variable_origination_uuid")
@@ -122,7 +197,7 @@ var scanCmd = &cobra.Command{
 					mu.Unlock()
 				}
 				if number != "" {
-					processAnswer(number, results, records, processedNumbers, &mu, done)
+					processAnswerFunc(number, results, records, processedNumbers, &mu, done)
 				}
 			case "CHANNEL_HANGUP":
 				cause := event.GetHeader("Hangup-Cause")
@@ -133,7 +208,7 @@ var scanCmd = &cobra.Command{
 					mu.Unlock()
 				}
 				if number != "" {
-					processHangup(number, cause, results, records, processedNumbers, &mu, done, event)
+					processHangupFunc(number, cause, results, records, processedNumbers, &mu, done, event)
 				}
 			}
 		})
@@ -156,8 +231,6 @@ var scanCmd = &cobra.Command{
 		var wg sync.WaitGroup
 		var resultWait chan struct{}
 		var timeoutDuration time.Duration
-		var outFile *os.File
-		var writer *csv.Writer
 
 		// 準備需要撥打的號碼清單
 		for i, record := range records {
@@ -188,7 +261,7 @@ var scanCmd = &cobra.Command{
 
 		if !hasNewCalls {
 			log.Println("所有號碼已有結果，無需撥號")
-			goto writeResults
+			goto finish
 		}
 
 		// 創建同時執行的最大撥號數量的工作槽
@@ -206,7 +279,12 @@ var scanCmd = &cobra.Command{
 				log.Printf("工作執行器 #%d 啟動", workerID)
 
 				for job := range jobs {
-					processDialJob(conn, job.index, job.number, job.uuid, ringTime, &mu, results, processedNumbers)
+					processDialJob(conn, job.index, job.number, job.uuid, ringTime, &mu, results, processedNumbers, &writerMutex, writer)
+					// 加入延遲
+					if dialDelay > 0 {
+						log.Printf("工作執行器 #%d 延遲 %d 毫秒", workerID, dialDelay)
+						time.Sleep(time.Duration(dialDelay) * time.Millisecond)
+					}
 				}
 
 				log.Printf("工作執行器 #%d 結束", workerID)
@@ -249,33 +327,27 @@ var scanCmd = &cobra.Command{
 			log.Println("等待結果逾時，將使用已有的結果")
 		}
 
-	writeResults:
+	finish:
 		// 移除事件監聽器並關閉連接
 		conn.RemoveEventListener(eslgo.EventListenAll, listenerID)
 		conn.Close()
 
-		outFile, err = os.Create("output.csv")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "無法建立輸出檔案: %v\n", err)
-			os.Exit(1)
-		}
-		defer outFile.Close()
+		// 檢查並寫入任何未處理的號碼結果
+		log.Println("檢查是否有未處理的號碼...")
+		for _, record := range records {
+			if len(record) > 0 {
+				number := record[0]
+				mu.Lock()
+				isProcessed := processedNumbers[number]
+				mu.Unlock()
 
-		writer = csv.NewWriter(outFile)
-		defer writer.Flush()
-
-		log.Println("寫入結果到 output.csv:")
-		for i, row := range results {
-			if len(row) > 0 {
-				log.Printf("寫入: %s -> %s", row[0], row[1])
-				if err := writer.Write(row); err != nil {
-					fmt.Fprintf(os.Stderr, "寫入 CSV 時發生錯誤: %v\n", err)
-				}
-			} else if i < len(records) && len(records[i]) > 0 {
-				number := records[i][0]
-				log.Printf("號碼 %s 無結果，寫入 NO_RESPONSE", number)
-				if err := writer.Write([]string{number, "NO_RESPONSE"}); err != nil {
-					fmt.Fprintf(os.Stderr, "寫入 CSV 時發生錯誤: %v\n", err)
+				if !isProcessed {
+					log.Printf("號碼 %s 無結果，標記為 NO_RESPONSE", number)
+					writerMutex.Lock()
+					writer.Write([]string{number, "NO_RESPONSE"})
+					writer.Flush()
+					writerMutex.Unlock()
+					log.Printf("已即時寫入 CSV: %s -> NO_RESPONSE", number)
 				}
 			}
 		}
@@ -285,7 +357,7 @@ var scanCmd = &cobra.Command{
 }
 
 // 處理單個撥號任務
-func processDialJob(conn *eslgo.Conn, index int, number, uuid string, ringTime int, mu *sync.Mutex, results [][]string, processedNumbers map[string]bool) {
+func processDialJob(conn *eslgo.Conn, index int, number, uuid string, ringTime int, mu *sync.Mutex, results [][]string, processedNumbers map[string]bool, writerMutex *sync.Mutex, writer *csv.Writer) {
 	log.Printf("開始處理撥號任務 #%d: %s (UUID: %s)", index, number, uuid)
 
 	// 設置此撥號任務正在處理中的標記
@@ -319,6 +391,13 @@ func processDialJob(conn *eslgo.Conn, index int, number, uuid string, ringTime i
 		if !processedNumbers[number] {
 			results[index] = []string{number, "originate_failed"}
 			processedNumbers[number] = true
+
+			// 即時寫入 CSV
+			writerMutex.Lock()
+			writer.Write([]string{number, "originate_failed"})
+			writer.Flush()
+			writerMutex.Unlock()
+			log.Printf("已即時寫入 CSV: %s -> originate_failed", number)
 		}
 		mu.Unlock()
 	} else {
@@ -352,42 +431,17 @@ func processDialJob(conn *eslgo.Conn, index int, number, uuid string, ringTime i
 			results[index] = []string{number, "NO_ANSWER"}
 			processedNumbers[number] = true
 			mu.Unlock()
+
+			// 即時寫入 CSV
+			writerMutex.Lock()
+			writer.Write([]string{number, "NO_ANSWER"})
+			writer.Flush()
+			writerMutex.Unlock()
+			log.Printf("已即時寫入 CSV: %s -> NO_ANSWER", number)
 		}
 	}
 
 	log.Printf("撥號任務 #%d 處理完成", index)
-}
-
-func processAnswer(number string, results [][]string, records [][]string, processedNumbers map[string]bool, mu *sync.Mutex, done chan struct{}) {
-	for i, record := range records {
-		if len(record) > 0 && record[0] == number {
-			mu.Lock()
-			if !processedNumbers[number] {
-				results[i] = []string{number, "ANSWERED"}
-				processedNumbers[number] = true
-				log.Printf("結果已更新: 索引=%d, 號碼=%s, 結果=ANSWERED", i, number)
-			}
-			mu.Unlock()
-			break
-		}
-	}
-	checkCompletion(processedNumbers, records, mu, done)
-}
-
-func processHangup(number, cause string, results [][]string, records [][]string, processedNumbers map[string]bool, mu *sync.Mutex, done chan struct{}, event *eslgo.Event) {
-	for i, record := range records {
-		if len(record) > 0 && record[0] == number {
-			mu.Lock()
-			if !processedNumbers[number] {
-				results[i] = []string{number, cause}
-				processedNumbers[number] = true
-				log.Printf("結果已更新: 索引=%d, 號碼=%s, 結果=%s", i, number, cause)
-			}
-			mu.Unlock()
-			break
-		}
-	}
-	checkCompletion(processedNumbers, records, mu, done)
 }
 
 func checkCompletion(processedNumbers map[string]bool, records [][]string, mu *sync.Mutex, done chan struct{}) {
