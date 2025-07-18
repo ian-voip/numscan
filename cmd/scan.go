@@ -52,31 +52,47 @@ func newSafeResultWriter(writer *csv.Writer, results [][]string, records [][]str
 }
 
 func (w *safeResultWriter) writeResult(index int, number, result string) {
-	w.writeResultWithOption(index, number, result, true)
+	w.writeResultWithDetails(index, number, result, "", true)
 }
 
-func (w *safeResultWriter) writeResultWithOption(index int, number, result string, writeToCSV bool) {
+func (w *safeResultWriter) writeResultWithDetails(index int, number, result, details string, writeToCSV bool) {
 	// 統一鎖的順序：先 mu，後 writerMutex
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.processedNumbers[number] {
-		return // 已處理過
+		// 如果號碼已處理，但這次有更詳細的資訊，就允許覆寫
+		if details != "" {
+			log.Printf("號碼 %s 已有結果，但收到更詳細的掛斷資訊，準備更新", number)
+		} else {
+			return // 已處理過，且沒有更詳細資訊
+		}
 	}
 
-	w.results[index] = []string{number, result}
+	var csvRow []string
+	if result == "ALLOTTED_TIMEOUT" {
+		csvRow = []string{number, "TIMEOUT", "ALLOTTED_TIMEOUT"}
+		w.results[index] = csvRow
+	} else if details != "" {
+		csvRow = []string{number, result, details}
+		w.results[index] = csvRow
+	} else {
+		csvRow = []string{number, result}
+		w.results[index] = csvRow
+	}
+
 	w.processedNumbers[number] = true
-	log.Printf("結果已更新: 索引=%d, 號碼=%s, 結果=%s", index, number, result)
+	log.Printf("結果已更新: 索引=%d, 號碼=%s, 結果=%s, 詳細=%s", index, number, result, details)
 
 	if writeToCSV {
 		// 即時寫入 CSV
 		w.writerMutex.Lock()
-		w.writer.Write([]string{number, result})
+		w.writer.Write(csvRow)
 		w.writer.Flush()
 		w.writerMutex.Unlock()
-		log.Printf("已即時寫入 CSV: %s -> %s", number, result)
+		log.Printf("已即時寫入 CSV: %s -> %s -> %s", number, result, details)
 	} else {
-		log.Printf("已載入現有結果: %s -> %s", number, result)
+		log.Printf("已載入現有結果: %s -> %s -> %s", number, result, details)
 	}
 
 	w.checkCompletion()
@@ -84,7 +100,12 @@ func (w *safeResultWriter) writeResultWithOption(index int, number, result strin
 
 // 用於處理已存在結果的號碼，不重複寫入 CSV
 func (w *safeResultWriter) markExistingResult(index int, number, result string) {
-	w.writeResultWithOption(index, number, result, false)
+	w.writeResultWithDetails(index, number, result, "", false)
+}
+
+// 用於處理有詳細信息的已存在結果
+func (w *safeResultWriter) markExistingResultWithDetails(index int, number, result, details string) {
+	w.writeResultWithDetails(index, number, result, details, false)
 }
 
 func (w *safeResultWriter) isProcessed(number string) bool {
@@ -95,8 +116,6 @@ func (w *safeResultWriter) isProcessed(number string) bool {
 
 func (w *safeResultWriter) checkCompletion() {
 	// 注意：此函數必須在持有 mu 鎖的情況下調用
-
-	// 計算實際有效的號碼數量
 	validNumbersCount := 0
 	for _, record := range w.records {
 		if len(record) > 0 && record[0] != "" {
@@ -104,7 +123,6 @@ func (w *safeResultWriter) checkCompletion() {
 		}
 	}
 
-	// 計算已處理的號碼數量
 	processedCount := len(w.processedNumbers)
 
 	log.Printf("已完成 %d/%d 通電話", processedCount, validNumbersCount)
@@ -124,7 +142,7 @@ var scanCmd = &cobra.Command{
 		fmt.Printf("準備執行 CSV 批次：%s\n", csvPath)
 		fmt.Printf("設置響鈴時間：%d 秒\n", ringTime)
 		fmt.Printf("設置並發數量：%d\n", concurrency)
-		fmt.Printf("設置撥號延遲：%d 毫秒\n", dialDelay) // 新增延遲輸出
+		fmt.Printf("設置撥號延遲：%d 毫秒\n", dialDelay)
 
 		file, err := os.Open(csvPath)
 		if err != nil {
@@ -140,7 +158,6 @@ var scanCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		// 創建或開啟輸出檔案
 		outFile, err := os.OpenFile("output.csv", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "無法開啟輸出檔案: %v\n", err)
@@ -150,15 +167,14 @@ var scanCmd = &cobra.Command{
 		writer := csv.NewWriter(outFile)
 		defer writer.Flush()
 
-		// 讀取已有的結果
-		existingResults := make(map[string]string)
+		existingResults := make(map[string][]string)
 		if outputFile, err := os.Open("output.csv"); err == nil {
 			defer outputFile.Close()
 			outputReader := csv.NewReader(outputFile)
 			if outputRecords, err := outputReader.ReadAll(); err == nil {
 				for _, record := range outputRecords {
 					if len(record) >= 2 {
-						existingResults[record[0]] = record[1]
+						existingResults[record[0]] = record
 					}
 				}
 			}
@@ -181,32 +197,47 @@ var scanCmd = &cobra.Command{
 		results := make([][]string, len(records))
 		resultWriter := newSafeResultWriter(writer, results, records)
 
-		// 用於追蹤號碼和 UUID 的對應關係
 		var uuidMutex sync.RWMutex
 		numberToUUID := make(map[string]string)
 		uuidToNumber := make(map[string]string)
+		// ⭐️ [修改 1] 新增一個 map 來追蹤已接聽的號碼
+		answeredNumbers := make(map[string]bool)
 
-		// 修改 processAnswer 和 processHangup 函數，使用安全的結果寫入器
+		// ⭐️ [修改 2] processAnswerFunc 不再寫入檔案，只記錄狀態
 		processAnswerFunc := func(number string) {
-			for i, record := range records {
-				if len(record) > 0 && record[0] == number {
-					resultWriter.writeResult(i, number, "ANSWERED")
-					break
-				}
-			}
+			uuidMutex.Lock()
+			answeredNumbers[number] = true
+			uuidMutex.Unlock()
+			log.Printf("號碼 %s 已接聽 (狀態已記錄)", number)
 		}
 
+		// ⭐️ [修改 3] processHangupFunc 成為唯一的結果寫入點
 		processHangupFunc := func(number, cause string) {
 			for i, record := range records {
 				if len(record) > 0 && record[0] == number {
-					// 如果已經被處理過（通常是 CHANNEL_ANSWER 事件先到），則跳過
 					if resultWriter.isProcessed(number) {
-						log.Printf("號碼 %s 已被處理過，跳過掛斷事件處理", number)
-						return
+						// 雖然理論上不應該在掛斷時才處理已處理過的號碼，但作為保險
+						// 允許 ALLOTTED_TIMEOUT 覆寫之前的結果
+						if cause != "ALLOTTED_TIMEOUT" {
+							log.Printf("號碼 %s 已被處理過，且掛斷原因非 ALLOTTED_TIMEOUT，跳過", number)
+							return
+						}
 					}
 
-					// 直接使用掛斷原因作為結果，不做特殊判斷
-					resultWriter.writeResult(i, number, cause)
+					uuidMutex.RLock()
+					isAnswered := answeredNumbers[number]
+					uuidMutex.RUnlock()
+
+					// 核心邏輯：根據是否接聽過和掛斷原因來寫入結果
+					if cause == "ALLOTTED_TIMEOUT" {
+						resultWriter.writeResultWithDetails(i, number, "ANSWERED", "ALLOTTED_TIMEOUT", true)
+					} else if isAnswered {
+						// 如果接聽過，但有其他掛斷原因 (例如對方提前掛斷)
+						resultWriter.writeResultWithDetails(i, number, "ANSWERED", cause, true)
+					} else {
+						// 如果從未接聽就掛斷了 (例如無應答、忙線)
+						resultWriter.writeResult(i, number, cause)
+					}
 					break
 				}
 			}
@@ -225,7 +256,6 @@ var scanCmd = &cobra.Command{
 				uuid = event.GetHeader("Channel-Call-Uuid")
 			}
 
-			// 從事件中獲取號碼
 			number := event.GetHeader("Other-Leg-Destination-Number")
 			if number == "" {
 				number = event.GetHeader("Caller-Destination-Number")
@@ -266,7 +296,6 @@ var scanCmd = &cobra.Command{
 
 		log.Println("開始撥打電話...")
 
-		// 預先宣告所有後續會用到的變數，避免goto跳過變數宣告
 		var hasNewCalls bool
 		var dialQueue []struct {
 			index  int
@@ -284,7 +313,6 @@ var scanCmd = &cobra.Command{
 		var timeoutDuration time.Duration
 		var totalEstimatedTime time.Duration
 
-		// 準備需要撥打的號碼清單
 		for i, record := range records {
 			if len(record) == 0 {
 				continue
@@ -292,10 +320,14 @@ var scanCmd = &cobra.Command{
 			number := record[0]
 			uuid := fmt.Sprintf("call-%d", i)
 
-			// 檢查是否已有結果
 			if status, exists := existingResults[number]; exists {
-				log.Printf("跳過 #%d: %s (已有結果: %s)", i, number, status)
-				resultWriter.markExistingResult(i, number, status)
+				if len(status) >= 3 {
+					log.Printf("跳過 #%d: %s (已有結果: %s, 詳細: %s)", i, number, status[1], status[2])
+					resultWriter.markExistingResultWithDetails(i, number, status[1], status[2])
+				} else if len(status) >= 2 {
+					log.Printf("跳過 #%d: %s (已有結果: %s)", i, number, status[1])
+					resultWriter.markExistingResult(i, number, status[1])
+				}
 				continue
 			}
 
@@ -313,14 +345,12 @@ var scanCmd = &cobra.Command{
 			goto finish
 		}
 
-		// 創建工作通道，使用較大的緩衝區避免阻塞
 		jobs = make(chan struct {
 			index  int
 			number string
 			uuid   string
 		}, len(dialQueue))
 
-		// 開始工作執行器
 		for i := 0; i < concurrency; i++ {
 			wg.Add(1)
 			go func(workerID int) {
@@ -329,7 +359,6 @@ var scanCmd = &cobra.Command{
 
 				for job := range jobs {
 					processDialJob(conn, job.index, job.number, job.uuid, ringTime, resultWriter)
-					// 加入延遲
 					if dialDelay > 0 {
 						log.Printf("工作執行器 #%d 延遲 %d 毫秒", workerID, dialDelay)
 						time.Sleep(time.Duration(dialDelay) * time.Millisecond)
@@ -340,29 +369,24 @@ var scanCmd = &cobra.Command{
 			}(i)
 		}
 
-		// 發送工作到工作通道
 		log.Printf("開始派發 %d 個撥號任務到 %d 個工作執行器", len(dialQueue), concurrency)
 		for _, job := range dialQueue {
 			jobs <- job
 		}
-		close(jobs) // 關閉工作通道，告知工作執行器沒有更多任務
+		close(jobs)
 
-		// 創建結果等待通道
 		resultWait = make(chan struct{})
 		go func() {
-			wg.Wait() // 等待所有工作執行器結束
+			wg.Wait()
 			close(resultWait)
 		}()
 
-		// 等待撥號完成或接收到結果
 		log.Println("等待撥號結果...")
 
-		// 計算更合理的總等待時間：考慮並發和延遲
 		totalEstimatedTime = time.Duration(totalDialCount/concurrency+1) * time.Duration(ringTime) * time.Second
 		if dialDelay > 0 {
 			totalEstimatedTime += time.Duration(totalDialCount*dialDelay) * time.Millisecond
 		}
-		// 額外增加30秒緩衝時間用於事件處理
 		timeoutDuration = totalEstimatedTime + 30*time.Second
 
 		log.Printf("預估總處理時間: %v, 設定超時時間: %v", totalEstimatedTime, timeoutDuration)
@@ -372,7 +396,6 @@ var scanCmd = &cobra.Command{
 			log.Println("所有電話結果已接收")
 		case <-resultWait:
 			log.Println("所有撥號任務已完成，等待額外20秒接收最後的結果...")
-			// 增加更長的等待時間，確保最後一批電話的結果可以被接收
 			select {
 			case <-resultWriter.done:
 				log.Println("在額外等待期間，所有電話結果已接收")
@@ -384,21 +407,22 @@ var scanCmd = &cobra.Command{
 		}
 
 	finish:
-		// 移除事件監聽器並關閉連接
 		conn.RemoveEventListener(eslgo.EventListenAll, listenerID)
 		conn.Close()
 
-		// 檢查並寫入任何未處理的號碼結果
 		log.Println("檢查是否有未處理的號碼...")
 		unprocessedCount := 0
 		for i, record := range records {
 			if len(record) > 0 {
 				number := record[0]
 				if !resultWriter.isProcessed(number) {
-					// 檢查是否在已有結果中但被跳過
-					if _, exists := existingResults[number]; exists {
+					if existingRecord, exists := existingResults[number]; exists {
 						log.Printf("號碼 %s 在已有結果中但未被正確載入，重新標記", number)
-						resultWriter.markExistingResult(i, number, existingResults[number])
+						if len(existingRecord) >= 3 {
+							resultWriter.markExistingResultWithDetails(i, number, existingRecord[1], existingRecord[2])
+						} else if len(existingRecord) >= 2 {
+							resultWriter.markExistingResult(i, number, existingRecord[1])
+						}
 					} else {
 						unprocessedCount++
 						log.Printf("號碼 %s 無結果（第%d個未處理），標記為 TIMEOUT", number, unprocessedCount)
@@ -412,7 +436,6 @@ var scanCmd = &cobra.Command{
 			log.Printf("警告：有 %d 個號碼未收到結果，可能需要調整超時時間或檢查網路連接", unprocessedCount)
 		}
 
-		// 統計處理結果
 		totalNumbers := 0
 		processedNumbers := 0
 		for _, record := range records {
@@ -433,13 +456,11 @@ var scanCmd = &cobra.Command{
 func processDialJob(conn *eslgo.Conn, index int, number, uuid string, ringTime int, resultWriter *safeResultWriter) {
 	log.Printf("開始處理撥號任務 #%d: %s (UUID: %s)", index, number, uuid)
 
-	// 檢查是否已處理
 	if resultWriter.isProcessed(number) {
 		log.Printf("跳過已處理的號碼 #%d: %s", index, number)
 		return
 	}
 
-	// 執行撥號
 	aLeg := eslgo.Leg{CallURL: "null"}
 	bLeg := eslgo.Leg{CallURL: fmt.Sprintf("%s XML numscan", number)}
 	vars := map[string]string{
@@ -459,20 +480,17 @@ func processDialJob(conn *eslgo.Conn, index int, number, uuid string, ringTime i
 		resultWriter.writeResult(index, number, "originate_failed")
 	} else {
 		log.Printf("撥號成功 #%d: %s, 等待結果", index, number)
-		// 等待ringTime+5秒，給予更充足的時間接收事件
 		waitTime := time.Duration(ringTime+5) * time.Second
 		startTime := time.Now()
 
-		// 等待直到收到結果或等待時間結束
 		for time.Since(startTime) < waitTime {
 			if resultWriter.isProcessed(number) {
 				log.Printf("已收到號碼 #%d: %s 的結果，不再等待", index, number)
-				return // 直接返回，不標記為 NO_ANSWER
+				return
 			}
-			time.Sleep(200 * time.Millisecond) // 減少睡眠時間，更頻繁檢查
+			time.Sleep(200 * time.Millisecond)
 		}
 
-		// 注意：不在這裡標記為 NO_ANSWER，讓主程序統一處理
 		log.Printf("撥號任務 #%d: %s 等待時間結束，將由主程序統一處理未收到結果的號碼", index, number)
 	}
 
