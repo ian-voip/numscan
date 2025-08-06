@@ -1,0 +1,15 @@
+# NumScan Configuration File
+
+[database]
+host = "localhost"
+port = "5432"
+user = "postgres"
+password = "your_password"
+dbname = "num"
+sslmode = "disable"
+timezone = "Asia/Taipei"
+
+[app]
+ring_time = 30      # Ring time in seconds
+concurrency = 10    # Number of concurrent dial operations
+dial_delay = 100    # Delay between dials in milliseconds

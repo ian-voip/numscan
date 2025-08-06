@@ -1,4 +1,4 @@
-.PHONY: clean build-all
+.PHONY: clean build-all gen run
 
 # 設置變量
 BINARY_NAME=numscan
@@ -19,3 +19,11 @@ build-all:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+gen:
+	@echo "Generating GORM code..."
+	$(GO) run tools/gen/main.go
+	@echo "GORM code generation completed!"
+
+run:
+	$(GO) run $(GOFLAGS) main.go
