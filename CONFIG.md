@@ -22,6 +22,13 @@ dbname = "numscan"
 sslmode = "disable"
 timezone = "Asia/Taipei"
 
+[esl]
+host = "localhost:8021"                    # FreeSWITCH ESL server host and port
+password = "ClueCon"                       # ESL authentication password
+reconnect_interval = "5s"                  # Interval between reconnection attempts
+health_check_interval = "30s"              # Interval for connection health checks
+max_reconnect_attempts = 10                # Maximum number of reconnection attempts
+
 [app]
 ring_time = 30      # Ring time in seconds
 concurrency = 10    # Number of concurrent dial operations
@@ -41,6 +48,13 @@ export NUMSCAN_DATABASE_PASSWORD=your_password
 export NUMSCAN_DATABASE_DBNAME=numscan
 export NUMSCAN_DATABASE_SSLMODE=disable
 export NUMSCAN_DATABASE_TIMEZONE=Asia/Taipei
+
+# ESL 配置
+export NUMSCAN_ESL_HOST=localhost:8021
+export NUMSCAN_ESL_PASSWORD=ClueCon
+export NUMSCAN_ESL_RECONNECT_INTERVAL=5s
+export NUMSCAN_ESL_HEALTH_CHECK_INTERVAL=30s
+export NUMSCAN_ESL_MAX_RECONNECT_ATTEMPTS=10
 
 # 應用程式配置
 export NUMSCAN_APP_RING_TIME=30
@@ -79,6 +93,13 @@ fmt.Println("Concurrency:", cfg.App.Concurrency)
 - DBName: `numscan`
 - SSLMode: `disable`
 - TimeZone: `Asia/Taipei`
+
+### ESL
+- Host: `localhost:8021`
+- Password: `ClueCon`
+- ReconnectInterval: `5s`
+- HealthCheckInterval: `30s`
+- MaxReconnectAttempts: `10`
 
 ### 應用程式
 - RingTime: `30` 秒

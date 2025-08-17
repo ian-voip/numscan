@@ -9,7 +9,30 @@ dbname = "num"
 sslmode = "disable"
 timezone = "Asia/Taipei"
 
+[esl]
+# FreeSWITCH ESL connection settings
+host = "64.52.80.198:8021"       # ESL server host and port
+password = "tomoon"          # ESL authentication password
+reconnect_interval = "5s"     # Interval between reconnection attempts
+health_check_interval = "30s" # Interval for connection health checks
+max_reconnect_attempts = 10   # Maximum number of reconnection attempts
+
 [app]
-ring_time = 30      # Ring time in seconds
-concurrency = 10    # Number of concurrent dial operations
-dial_delay = 100    # Delay between dials in milliseconds
+ring_time = 30   # Ring time in seconds
+concurrency = 10 # Number of concurrent dial operations
+dial_delay = 100 # Delay between dials in milliseconds
+
+# Timeout settings
+scan_timeout_buffer = 60    # Extra buffer time for scan operations in seconds
+dial_timeout_buffer = 15    # Extra buffer time for individual dial operations in seconds
+db_operation_timeout = 30   # Database operation timeout in seconds
+
+[logging]
+level = "info"           # Log level: debug, info, warn, error
+format = "text"          # Log format: json, text
+output = "stdout"        # Output: stdout, stderr, file
+file_path = "logs/numscan.log"  # Log file path (when output is file)
+max_size = 100           # Max log file size in MB
+max_backups = 3          # Max number of backup files
+max_age = 28             # Max age of log files in days
+compress = true          # Compress old log files

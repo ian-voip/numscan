@@ -17,7 +17,7 @@ import (
 // AddNumbersInput 添加電話號碼的輸入
 type AddNumbersInput struct {
 	Body struct {
-		Numbers []string `json:"numbers" minItems:"1" maxItems:"1000" doc:"要添加的電話號碼陣列" example:"[\"3024441356\"]"`
+		Numbers []string `json:"numbers" minItems:"1" maxItems:"1000" doc:"要添加的電話號碼陣列" example:"[\"07743368505\"]"`
 	}
 }
 

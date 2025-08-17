@@ -10,6 +10,7 @@ import (
 	"github.com/riverqueue/river"
 	"gorm.io/gorm"
 
+	"numscan/internal/config"
 	"numscan/internal/models"
 	"numscan/internal/query"
 	"numscan/internal/services"
@@ -26,6 +27,13 @@ type ScanPhoneNumberArgs struct {
 // Kind 實現 river.JobArgs 介面
 func (ScanPhoneNumberArgs) Kind() string { return "scan_phone_number" }
 
+// InsertOpts 實現 river.JobArgsWithInsertOpts 介面，禁用重試機制
+func (ScanPhoneNumberArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		MaxAttempts: 1, // 只嘗試一次，不重試
+	}
+}
+
 // ScanPhoneNumberWorker 掃描電話號碼的 worker
 type ScanPhoneNumberWorker struct {
 	river.WorkerDefaults[ScanPhoneNumberArgs]
@@ -35,11 +43,11 @@ type ScanPhoneNumberWorker struct {
 }
 
 // NewScanPhoneNumberWorker 建立新的掃描電話號碼 worker
-func NewScanPhoneNumberWorker(db *gorm.DB, q *query.Query) *ScanPhoneNumberWorker {
+func NewScanPhoneNumberWorker(db *gorm.DB, q *query.Query, scanService *services.ScanService) *ScanPhoneNumberWorker {
 	return &ScanPhoneNumberWorker{
 		db:          db,
 		query:       q,
-		scanService: services.NewScanService(db, q),
+		scanService: scanService,
 	}
 }
 
@@ -64,21 +72,33 @@ func (w *ScanPhoneNumberWorker) Work(ctx context.Context, job *river.Job[ScanPho
 		return fmt.Errorf("更新電話號碼狀態失敗: %w", err)
 	}
 
+	// 獲取應用配置
+	appConfig := config.GetConfig()
+	if appConfig == nil {
+		return fmt.Errorf("無法獲取應用配置")
+	}
+
 	// 創建掃描配置
-	config := &services.ScanConfig{
-		Numbers:     []string{args.Number},
-		RingTime:    args.RingTime,
-		Concurrency: 1, // 單個號碼使用單一併發
-		DialDelay:   args.DialDelay,
+	scanConfig := &services.ScanConfig{
+		Numbers:            []string{args.Number},
+		RingTime:           args.RingTime,
+		Concurrency:        1, // 單個號碼使用單一併發
+		DialDelay:          args.DialDelay,
+		ScanTimeoutBuffer:  appConfig.App.ScanTimeoutBuffer,
+		DialTimeoutBuffer:  appConfig.App.DialTimeoutBuffer,
+		DBOperationTimeout: appConfig.App.DBOperationTimeout,
 	}
 
 	// 執行掃描
-	results, err := w.scanService.Scan(ctx, config)
+	results, err := w.scanService.Scan(ctx, scanConfig)
 
 	if err != nil {
 		// 標記為失敗
 		phoneNumber.MarkAsFailed(err.Error())
-		if saveErr := phoneNumberDAO.WithContext(ctx).Save(phoneNumber); saveErr != nil {
+		// 使用新的context來避免deadline exceeded錯誤
+		saveCtx, cancel := context.WithTimeout(context.Background(), time.Duration(appConfig.App.DBOperationTimeout)*time.Second)
+		defer cancel()
+		if saveErr := phoneNumberDAO.WithContext(saveCtx).Save(phoneNumber); saveErr != nil {
 			log.Printf("儲存失敗狀態時發生錯誤: %v", saveErr)
 		}
 		return fmt.Errorf("掃描電話號碼失敗: %w", err)
@@ -117,8 +137,10 @@ func (w *ScanPhoneNumberWorker) Work(ctx context.Context, job *river.Job[ScanPho
 		phoneNumber.MarkAsFailed("沒有得到掃描結果")
 	}
 
-	// 儲存最終結果
-	if err := phoneNumberDAO.WithContext(ctx).Save(phoneNumber); err != nil {
+	// 儲存最終結果 - 使用新的context來避免deadline exceeded錯誤
+	saveCtx, cancel := context.WithTimeout(context.Background(), time.Duration(appConfig.App.DBOperationTimeout)*time.Second)
+	defer cancel()
+	if err := phoneNumberDAO.WithContext(saveCtx).Save(phoneNumber); err != nil {
 		return fmt.Errorf("儲存掃描結果失敗: %w", err)
 	}
 
@@ -137,6 +159,13 @@ type BatchScanJobArgs struct {
 
 // Kind 實現 river.JobArgs 介面
 func (BatchScanJobArgs) Kind() string { return "batch_scan_job" }
+
+// InsertOpts 實現 river.JobArgsWithInsertOpts 介面，禁用重試機制
+func (BatchScanJobArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		MaxAttempts: 1, // 只嘗試一次，不重試
+	}
+}
 
 // BatchScanJobWorker 批次掃描作業的 worker
 type BatchScanJobWorker struct {

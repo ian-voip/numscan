@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -22,6 +23,8 @@ import (
 
 	"numscan/internal/config"
 	"numscan/internal/database"
+	"numscan/internal/esl"
+	"numscan/internal/logger"
 	"numscan/internal/query"
 	"numscan/internal/queue"
 	"numscan/internal/services"
@@ -36,30 +39,75 @@ type Server struct {
 	pgxPool       *pgxpool.Pool
 	query         *query.Query
 	scanService   *services.ScanService  // 共用的掃描服務
+	eslManager    *esl.ConnectionManager // ESL連接管理器
 	riverClient   *river.Client[*sql.Tx] // 給GORM用的River client
 	riverUIClient *river.Client[pgx.Tx]  // 給UI用的River client
 	riverUIServer *riverui.Server
 }
 
 func New() *Server {
-	// 初始化資料庫連線 (GORM 和 River 共享同一個 sql.DB)
-	db, sqlDB, err := database.Initialize("config.toml")
-	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
-	}
-
-	// 初始化 GORM Gen Query
-	q := query.Use(db)
-
 	// 載入配置
 	cfg, err := config.Load("config.toml")
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	// 初始化結構化日誌系統
+	loggerConfig := &logger.LoggingConfig{
+		Level:      cfg.Logging.Level,
+		Format:     cfg.Logging.Format,
+		Output:     cfg.Logging.Output,
+		FilePath:   cfg.Logging.FilePath,
+		MaxSize:    cfg.Logging.MaxSize,
+		MaxBackups: cfg.Logging.MaxBackups,
+		MaxAge:     cfg.Logging.MaxAge,
+		Compress:   cfg.Logging.Compress,
+	}
+
+	if err := logger.InitDefaultLogger(loggerConfig); err != nil {
+		log.Fatalf("Failed to initialize logger: %v", err)
+	}
+
+	structuredLogger := logger.GetDefaultLogger()
+	structuredLogger.Info("NumScan server starting up",
+		slog.String("version", "1.0.0"),
+		slog.String("log_level", cfg.Logging.Level),
+		slog.String("log_format", cfg.Logging.Format),
+	)
+
+	// 初始化資料庫連線 (GORM 和 River 共享同一個 sql.DB)
+	db, sqlDB, err := database.Initialize("config.toml")
+	if err != nil {
+		structuredLogger.Error("Failed to initialize database", slog.String("error", err.Error()))
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	structuredLogger.Info("Database connection established")
+
+	// 初始化 GORM Gen Query
+	q := query.Use(db)
+
+	// 初始化ESL管理器
+	eslConfig := &esl.ESLConfig{
+		Host:                 cfg.ESL.Host,
+		Password:             cfg.ESL.Password,
+		ReconnectInterval:    cfg.ESL.ReconnectInterval,
+		HealthCheckInterval:  cfg.ESL.HealthCheckInterval,
+		MaxReconnectAttempts: cfg.ESL.MaxReconnectAttempts,
+	}
+	eslManager := esl.NewConnectionManager(eslConfig)
+	structuredLogger.Info("ESL manager initialized",
+		slog.String("host", cfg.ESL.Host),
+		slog.Duration("reconnect_interval", cfg.ESL.ReconnectInterval),
+		slog.Duration("health_check_interval", cfg.ESL.HealthCheckInterval),
+		slog.Int("max_reconnect_attempts", cfg.ESL.MaxReconnectAttempts),
+	)
+
+	// 初始化共用的掃描服務（無狀態服務，可以安全共用）
+	scanService := services.NewScanService(db, q, eslManager)
+
 	// 創建 River workers
 	workers := river.NewWorkers()
-	river.AddWorker(workers, queue.NewScanPhoneNumberWorker(db, q))
+	river.AddWorker(workers, queue.NewScanPhoneNumberWorker(db, q, scanService))
 
 	// 初始化 River client (用於GORM整合) - 使用 sql.DB
 	riverClient, err := river.NewClient(riverdatabasesql.New(sqlDB), &river.Config{
@@ -80,7 +128,7 @@ func New() *Server {
 
 	// 創建獨立的UI workers (可以是空的，因為實際工作由上面的riverClient處理)
 	uiWorkers := river.NewWorkers()
-	river.AddWorker(uiWorkers, queue.NewScanPhoneNumberWorker(db, q))
+	river.AddWorker(uiWorkers, queue.NewScanPhoneNumberWorker(db, q, scanService))
 
 	// 初始化 River UI client - 使用 pgx
 	riverUIClient, err := river.NewClient(riverpgxv5.New(pgxPool), &river.Config{
@@ -97,7 +145,7 @@ func New() *Server {
 	riverUIServer, err := riverui.NewServer(&riverui.ServerOpts{
 		Client: riverUIClient,
 		DB:     pgxPool,
-		Logger: slog.Default(),  // 使用結構化 logger
+		Logger: slog.Default(), // 使用結構化 logger
 		Prefix: "/admin/river", // 將 UI 掛載到 /admin/river 路徑下
 	})
 	if err != nil {
@@ -140,9 +188,6 @@ func New() *Server {
 		// RateLimitMiddleware,    // 速率限制（如需要）
 	)
 
-	// 初始化共用的掃描服務（無狀態服務，可以安全共用）
-	scanService := services.NewScanService(db, q)
-
 	s := &Server{
 		router:        r,
 		api:           api,
@@ -151,6 +196,7 @@ func New() *Server {
 		pgxPool:       pgxPool,
 		query:         q,
 		scanService:   scanService,
+		eslManager:    eslManager,
 		riverClient:   riverClient,
 		riverUIClient: riverUIClient,
 		riverUIServer: riverUIServer,
@@ -214,32 +260,46 @@ func (s *Server) adminAuthMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) Start(addr string) error {
 	ctx := context.Background()
+	structuredLogger := logger.GetDefaultLogger()
+
+	// 啟動ESL連接
+	structuredLogger.Info("Connecting to FreeSWITCH ESL server")
+	if err := s.eslManager.Connect(ctx); err != nil {
+		structuredLogger.Error("Failed to connect to FreeSWITCH", slog.String("error", err.Error()))
+		return fmt.Errorf("failed to connect to FreeSWITCH: %w", err)
+	}
+	structuredLogger.Info("ESL connection established successfully")
 
 	// 啟動主要的 River client（處理實際任務）
 	err := s.riverClient.Start(ctx)
 	if err != nil {
+		structuredLogger.Error("Failed to start River queue worker", slog.String("error", err.Error()))
 		return err
 	}
-	log.Printf("River queue worker started")
+	structuredLogger.Info("River queue worker started")
 
 	// 啟動 River UI client（用於監控）
 	err = s.riverUIClient.Start(ctx)
 	if err != nil {
+		structuredLogger.Error("Failed to start River UI client", slog.String("error", err.Error()))
 		return err
 	}
-	log.Printf("River UI client started")
+	structuredLogger.Info("River UI client started")
 
 	// 啟動 River UI server
 	err = s.riverUIServer.Start(ctx)
 	if err != nil {
+		structuredLogger.Error("Failed to start River UI server", slog.String("error", err.Error()))
 		return err
 	}
-	log.Printf("River UI server started")
+	structuredLogger.Info("River UI server started")
 
-	log.Printf("Starting NumScan API server on %s", addr)
-	log.Printf("API Documentation available at: http://%s/docs", addr)
-	log.Printf("OpenAPI specification at: http://%s/openapi.json", addr)
-	log.Printf("River UI available at: http://%s/admin/river", addr)
+	structuredLogger.Info("Starting NumScan API server",
+		slog.String("address", addr),
+		slog.String("docs_url", fmt.Sprintf("http://%s/docs", addr)),
+		slog.String("openapi_url", fmt.Sprintf("http://%s/openapi.json", addr)),
+		slog.String("river_ui_url", fmt.Sprintf("http://%s/admin/river", addr)),
+	)
 
 	s.server = &http.Server{
 		Addr:    addr,
@@ -255,35 +315,67 @@ func (s *Server) Start(addr string) error {
 
 func (s *Server) Stop(ctx context.Context) error {
 	var err error
+	structuredLogger := logger.GetDefaultLogger()
+
+	structuredLogger.Info("Shutting down NumScan server")
+
+	// 優雅關閉ESL連接
+	if s.eslManager != nil {
+		structuredLogger.Info("Disconnecting ESL connection")
+		if eslErr := s.eslManager.Disconnect(); eslErr != nil {
+			structuredLogger.Error("Error disconnecting ESL", slog.String("error", eslErr.Error()))
+			if err == nil {
+				err = eslErr
+			}
+		} else {
+			structuredLogger.Info("ESL connection closed successfully")
+		}
+	}
 
 	// 停止主要的 River client
 	if s.riverClient != nil {
+		structuredLogger.Info("Stopping River queue worker")
 		s.riverClient.Stop(ctx)
-		log.Printf("River queue worker stopped")
+		structuredLogger.Info("River queue worker stopped")
 	}
 
 	// 停止 River UI client
 	if s.riverUIClient != nil {
+		structuredLogger.Info("Stopping River UI client")
 		s.riverUIClient.Stop(ctx)
-		log.Printf("River UI client stopped")
+		structuredLogger.Info("River UI client stopped")
 	}
 
 	// 關閉 pgx 連接池
 	if s.pgxPool != nil {
+		structuredLogger.Info("Closing PGX connection pool")
 		s.pgxPool.Close()
-		log.Printf("PGX connection pool closed")
+		structuredLogger.Info("PGX connection pool closed")
 	}
 
 	// River UI server 會隨著 HTTP server 停止而停止
 	if s.riverUIServer != nil {
-		log.Printf("River UI server stopped")
+		structuredLogger.Info("River UI server stopped")
 	}
 
 	// 停止 HTTP server
 	if s.server != nil {
+		structuredLogger.Info("Shutting down HTTP server")
 		err = s.server.Shutdown(ctx)
-		log.Printf("HTTP server stopped")
+		structuredLogger.Info("HTTP server stopped")
 	}
 
+	// 記錄連接監控指標
+	metrics := logger.GetConnectionMetrics()
+	structuredLogger.Info("Final connection metrics",
+		slog.Int64("total_connections", metrics.TotalConnections),
+		slog.Int64("successful_connections", metrics.SuccessfulConnections),
+		slog.Int64("failed_connections", metrics.FailedConnections),
+		slog.Int64("total_reconnects", metrics.TotalReconnects),
+		slog.Int64("total_health_checks", metrics.TotalHealthChecks),
+		slog.Duration("current_uptime", metrics.CurrentUptime),
+	)
+
+	structuredLogger.Info("NumScan server shutdown complete")
 	return err
 }
